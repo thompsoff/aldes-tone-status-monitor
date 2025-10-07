@@ -4,6 +4,8 @@
 #include <Preferences.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <stdint.h>
+#include <string.h>
 
 //
 // ------- Réglages matériels -------
@@ -53,6 +55,27 @@ const size_t MAX_EDGES = 128;
 Edge edges[MAX_EDGES];
 size_t edgeCount = 0;
 unsigned long lastSample = 0, lastWindowPurge = 0;
+
+// ====== Package definition (fits in 1 ESP-NOW frame) ======
+#define MAX_DATA_LEN 232  // 250 - 16(UUID) - 2(length)
+
+typedef struct __attribute__((packed)) {
+  uint32_t uuid[4];          // 128-bit UUID (random)
+  uint16_t length;           // bytes used in data[]
+  char     data[MAX_DATA_LEN];
+} struct_package;
+
+// ====== UUID helpers ======
+static inline void uuid_random(uint32_t out[4]) {
+  // Call after WiFi.mode(WIFI_STA) so RNG is fully available
+  out[0] = esp_random();
+  out[1] = esp_random();
+  out[2] = esp_random();
+  out[3] = esp_random();
+}
+static inline bool uuid_equal(const uint32_t a[4], const uint32_t b[4]) {
+  return (a[0]==b[0]) && (a[1]==b[1]) && (a[2]==b[2]) && (a[3]==b[3]);
+}
 
 //
 // ------- ESP-NOW (broadcast reboot quand BLINK >= 10s) -------
@@ -276,6 +299,8 @@ void handleConfigPost(){
   server.send(400, "application/json; charset=utf-8", "{\"ok\":false}");
 }
 
+struct_package outPkg;
+
 //
 // ------- Setup / Loop -------
 //
@@ -302,6 +327,11 @@ void setup(){
 
   // Wi-Fi en AP+STA (héberge l'UI et active ESP-NOW)
   WiFi.mode(WIFI_AP_STA);
+  
+  // // Enable Long Range (LR) + 11b on both interfaces (AP & STA)
+  // esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR);
+  // esp_wifi_set_protocol(WIFI_IF_AP,  WIFI_PROTOCOL_11B | WIFI_PROTOCOL_LR);
+
   if(WiFi.softAP(AP_SSID, AP_PASS)){
     Serial.print("AP "); Serial.print(AP_SSID); Serial.print(" IP="); Serial.println(WiFi.softAPIP());
   } else {
@@ -323,6 +353,11 @@ void setup(){
     Serial.println("Failed to add broadcast peer");
     while(true){ delay(1000); }
   }
+
+  // Constant payload for the example
+  const char* msg = "reboot";
+  outPkg.length = strlen(msg);
+  memcpy(outPkg.data, msg, outPkg.length);
 
   // HTTP routes
   server.on("/", handleRoot);
@@ -391,15 +426,15 @@ void loop(){
   if (blinkLongEnough && (now - lastRebootSendMs >= REBOOT_SEND_INTERVAL_MS)) {
     lastRebootSendMs = now;
 
-    // Buffer "reboot" + octet nul ajouté manuellement (7 octets)
-    uint8_t msg[7] = { 'r','e','b','o','o','t','\0' };
+    // New UUID for every message
+    uuid_random(outPkg.uuid);
+    esp_err_t res = esp_now_send(broadcastAddress, reinterpret_cast<const uint8_t*>(&outPkg), sizeof(outPkg));
 
-    esp_err_t res = esp_now_send(broadcastAddress, msg, sizeof(msg)); // inclut bien le '\0'
     if (res != ESP_OK) {
       Serial.print("esp_now_send() error: ");
       Serial.println(res);
     } else {
-      Serial.println("Sent: reboot\\0 (broadcast)");
+      Serial.println("Sent: reboot (broadcast)");
     }
   }
 
